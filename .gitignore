@@ -1,0 +1,3 @@
+**/testfiles/
+**/decrypted_testfiles/
+**/*.pem
