@@ -10,9 +10,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"encoding/binary"
 )
 
-// Генерация RSA-ключей
+// Generate RSA key pair
 func generateRSAKeys(bits int) (*rsa.PrivateKey, error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
@@ -21,74 +22,82 @@ func generateRSAKeys(bits int) (*rsa.PrivateKey, error) {
 	return privateKey, nil
 }
 
-// Шифрование AES-ключа с помощью RSA
+// Encrypt AES key using RSA public key
 func encryptAESKey(aesKey []byte, publicKey *rsa.PublicKey) ([]byte, error) {
+	fmt.Printf("🔑 AES Key before encryption: %x\n", aesKey)
 	return rsa.EncryptPKCS1v15(rand.Reader, publicKey, aesKey)
 }
 
-// Потоковое шифрование файла с использованием AES-256-GCM
+// Modified encryption method
 func encryptFileStream(inputFile, outputFile string, aesKey []byte) error {
-	// Открываем входной файл
-	inFile, err := os.Open(inputFile)
-	if err != nil {
-		return err
-	}
-	defer inFile.Close()
+    // Open input file
+    inFile, err := os.Open(inputFile)
+    if err != nil {
+        return err
+    }
+    defer inFile.Close()
 
-	// Создаем выходной файл
-	outFile, err := os.Create(outputFile)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
+    // Create output file
+    outFile, err := os.Create(outputFile)
+    if err != nil {
+        return err
+    }
+    defer outFile.Close()
 
-	// Генерируем случайный nonce (12 байт для AES-GCM)
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return err
-	}
+    // Create AES-GCM cipher
+    block, err := aes.NewCipher(aesKey)
+    if err != nil {
+        return err
+    }
+    aesGCM, err := cipher.NewGCM(block)
+    if err != nil {
+        return err
+    }
 
-	// Записываем nonce в начало выходного файла
-	if _, err := outFile.Write(nonce); err != nil {
-		return err
-	}
+    // Process file in chunks
+    buffer := make([]byte, 1024*1024) // 1 MB chunks
+    for {
+        // Read file chunk
+        n, err := inFile.Read(buffer)
+        if err != nil && err != io.EOF {
+            return err
+        }
+        if n == 0 {
+            break
+        }
 
-	// Создаем AES-GCM шифр
-	block, err := aes.NewCipher(aesKey)
-	if err != nil {
-		return err
-	}
+        // Create a unique nonce for each chunk
+        chunkNonce := make([]byte, 12)
+        if _, err := io.ReadFull(rand.Reader, chunkNonce); err != nil {
+            return err
+        }
 
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
+        // Encrypt chunk
+        ciphertext := aesGCM.Seal(nil, chunkNonce, buffer[:n], nil)
 
-	// Читаем файл и шифруем его частями
-	buffer := make([]byte, 1024*1024) // 1 МБ блоки
-	for {
-		n, err := inFile.Read(buffer)
-		if err != nil && err != io.EOF {
-			return err
-		}
-		if n == 0 {
-			break
-		}
+        // Write nonce before encrypted chunk
+        if _, err := outFile.Write(chunkNonce); err != nil {
+            return err
+        }
+        
+        // Write encrypted chunk length (4 bytes)
+        lenBytes := make([]byte, 4)
+        binary.BigEndian.PutUint32(lenBytes, uint32(len(ciphertext)))
+        if _, err := outFile.Write(lenBytes); err != nil {
+            return err
+        }
 
-		// Шифруем блок
-		ciphertext := aesGCM.Seal(nil, nonce, buffer[:n], nil)
+        // Write encrypted chunk to output file
+        if _, err := outFile.Write(ciphertext); err != nil {
+            return err
+        }
+    }
 
-		// Записываем зашифрованный блок в выходной файл
-		if _, err := outFile.Write(ciphertext); err != nil {
-			return err
-		}
-	}
-
-	fmt.Println("Файл успешно зашифрован:", outputFile)
-	return nil
+    fmt.Println("File successfully encrypted:", outputFile)
+    return nil
 }
 
-// Сохранение RSA-ключей в файлы
+// Save RSA keys to PEM files
 func saveRSAKeys(privateKey *rsa.PrivateKey) error {
 	privFile, err := os.Create("private.pem")
 	if err != nil {
@@ -116,58 +125,68 @@ func saveRSAKeys(privateKey *rsa.PrivateKey) error {
 	return nil
 }
 
+// Increment nonce to make it unique per chunk
+func incrementNonce(nonce []byte) {
+	for i := len(nonce) - 1; i >= 0; i-- {
+		nonce[i]++
+		if nonce[i] != 0 {
+			break
+		}
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Использование: go run encrypt.go <файл>")
+		fmt.Println("Usage: go run encrypt.go <file>")
 		return
 	}
 	inputFile := os.Args[1]
 	outputFile := inputFile + ".enc"
 	keyFile := inputFile + ".key.enc"
 
-	// 1️⃣ Генерация RSA-ключей (2048 бит)
+	// Generate RSA key pair (2048-bit)
 	privateKey, err := generateRSAKeys(2048)
 	if err != nil {
-		fmt.Println("Ошибка генерации RSA-ключей:", err)
+		fmt.Println("Error generating RSA keys:", err)
 		return
 	}
 
-	// Сохранение RSA-ключей
+	// Save RSA keys
 	err = saveRSAKeys(privateKey)
 	if err != nil {
-		fmt.Println("Ошибка сохранения RSA-ключей:", err)
+		fmt.Println("Error saving RSA keys:", err)
 		return
 	}
 
-	// 2️⃣ Генерация AES-256 ключа (32 байта)
+	// Generate AES-256 key (32 bytes)
 	aesKey := make([]byte, 32)
 	if _, err := rand.Read(aesKey); err != nil {
-		fmt.Println("Ошибка генерации AES-ключа:", err)
+		fmt.Println("Error generating AES key:", err)
 		return
 	}
 
-	// 3️⃣ Шифрование файла потоковым методом
+	// Encrypt file using streaming AES-GCM
 	err = encryptFileStream(inputFile, outputFile, aesKey)
 	if err != nil {
-		fmt.Println("Ошибка шифрования файла:", err)
+		fmt.Println("Error encrypting file:", err)
 		return
 	}
 
-	// 4️⃣ Шифрование AES-ключа RSA-ключом
+	// Encrypt AES key with RSA public key
 	encryptedAESKey, err := encryptAESKey(aesKey, &privateKey.PublicKey)
 	if err != nil {
-		fmt.Println("Ошибка шифрования AES-ключа:", err)
+		fmt.Println("Error encrypting AES key:", err)
 		return
 	}
 
-	// 5️⃣ Сохранение зашифрованного AES-ключа
+	// Save encrypted AES key
 	err = os.WriteFile(keyFile, encryptedAESKey, 0644)
 	if err != nil {
-		fmt.Println("Ошибка сохранения зашифрованного AES-ключа:", err)
+		fmt.Println("Error saving encrypted AES key:", err)
 		return
 	}
 
-	fmt.Println("Файл зашифрован:", outputFile)
-	fmt.Println("Зашифрованный AES-ключ сохранен:", keyFile)
-	fmt.Println("RSA-ключи сохранены в private.pem и public.pem")
+	fmt.Println("Encrypted file:", outputFile)
+	fmt.Println("Encrypted AES key saved:", keyFile)
+	fmt.Println("RSA keys saved in private.pem and public.pem")
 }

@@ -10,7 +10,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"encoding/binary"
 )
+
+// Increment nonce for each chunk
+func incrementNonce(nonce []byte) {
+	for i := len(nonce) - 1; i >= 0; i-- {
+		nonce[i]++
+		if nonce[i] != 0 {
+			break
+		}
+	}
+}
 
 // Load RSA private key from file
 func loadRSAPrivateKey(filename string) (*rsa.PrivateKey, error) {
@@ -38,66 +49,74 @@ func decryptAESKey(encryptedAESKey []byte, privateKey *rsa.PrivateKey) ([]byte, 
 }
 
 // Stream decrypt file using AES-256-GCM
+// Modified decryption method
 func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
-	// Open encrypted input file
-	inFile, err := os.Open(inputFile)
-	if err != nil {
-		return err
-	}
-	defer inFile.Close()
+    // Open the encrypted input file
+    inFile, err := os.Open(inputFile)
+    if err != nil {
+        return err
+    }
+    defer inFile.Close()
 
-	// Create output file
-	outFile, err := os.Create(outputFile)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
+    // Create the output file
+    outFile, err := os.Create(outputFile)
+    if err != nil {
+        return err
+    }
+    defer outFile.Close()
 
-	// Read nonce (first 12 bytes)
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(inFile, nonce); err != nil {
-		return err
-	}
+    // Create AES-GCM cipher
+    block, err := aes.NewCipher(aesKey)
+    if err != nil {
+        return err
+    }
+    aesGCM, err := cipher.NewGCM(block)
+    if err != nil {
+        return err
+    }
 
-	// Create AES-GCM cipher
-	block, err := aes.NewCipher(aesKey)
-	if err != nil {
-		return err
-	}
+    // Read and decrypt file chunk by chunk
+    for {
+        // Read nonce (12 bytes)
+        nonce := make([]byte, 12)
+        _, err := io.ReadFull(inFile, nonce)
+        if err != nil {
+            if err == io.EOF {
+                break
+            }
+            return err
+        }
 
-	aesGCM, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
+        // Read encrypted chunk length (4 bytes)
+        lenBytes := make([]byte, 4)
+        if _, err := io.ReadFull(inFile, lenBytes); err != nil {
+            return err
+        }
+        ciphertextLen := binary.BigEndian.Uint32(lenBytes)
 
-	// Read and decrypt the file chunk by chunk
-	buffer := make([]byte, 1024*1024) // 1 MB buffer
-	for {
-		// Read encrypted chunk
-		n, err := inFile.Read(buffer)
-		if err != nil && err != io.EOF {
-			return err
-		}
-		if n == 0 {
-			break
-		}
+        // Read encrypted chunk
+        ciphertext := make([]byte, ciphertextLen)
+        if _, err := io.ReadFull(inFile, ciphertext); err != nil {
+            return err
+        }
 
-		// Decrypt the chunk
-		plaintext, err := aesGCM.Open(nil, nonce, buffer[:n], nil)
-		if err != nil {
-			return err
-		}
+        // Decrypt chunk
+        plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
+        if err != nil {
+            return err
+        }
 
-		// Write decrypted data to output file
-		if _, err := outFile.Write(plaintext); err != nil {
-			return err
-		}
-	}
+        // Write decrypted data to output file
+        if _, err := outFile.Write(plaintext); err != nil {
+            return err
+        }
+    }
 
-	fmt.Println("File successfully decrypted:", outputFile)
-	return nil
+    fmt.Println("File successfully decrypted:", outputFile)
+    return nil
 }
 
+// Main function to execute decryption
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Usage: go run decrypt.go <encrypted_file> <encrypted_key_file>")
@@ -128,6 +147,9 @@ func main() {
 		fmt.Println("Error decrypting AES key:", err)
 		return
 	}
+
+	// Debugging AES key
+	fmt.Printf("🔑 AES Key after decryption: %x\n", aesKey)
 
 	// Decrypt file using AES-256-GCM in streaming mode
 	err = decryptFileStream(encryptedFile, outputFile, aesKey)
