@@ -1,17 +1,30 @@
 package main
 
 import (
+	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
-	"encoding/binary"
+	"runtime"
+	"sync"
 )
+
+// DecryptWork represents decryption work for a goroutine
+type DecryptWork struct {
+	data       []byte
+	nonce      []byte
+	index      int
+	isEncrypted bool
+	result     []byte
+	err        error
+}
 
 // Increment nonce for each chunk
 func incrementNonce(nonce []byte) {
@@ -48,72 +61,176 @@ func decryptAESKey(encryptedAESKey []byte, privateKey *rsa.PrivateKey) ([]byte, 
 	return rsa.DecryptPKCS1v15(rand.Reader, privateKey, encryptedAESKey)
 }
 
-// Stream decrypt file using AES-256-GCM
-// Modified decryption method
+// Optimized stream decrypt with multithreading
 func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
-    // Open the encrypted input file
-    inFile, err := os.Open(inputFile)
-    if err != nil {
-        return err
-    }
-    defer inFile.Close()
+	// Open with buffered I/O
+	inFile, err := os.Open(inputFile)
+	if err != nil {
+		return err
+	}
+	defer inFile.Close()
+	
+	reader := bufio.NewReaderSize(inFile, 8*1024*1024) // 8MB buffer
 
-    // Create the output file
-    outFile, err := os.Create(outputFile)
-    if err != nil {
-        return err
-    }
-    defer outFile.Close()
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	
+	writer := bufio.NewWriterSize(outFile, 8*1024*1024) // 8MB buffer
+	defer writer.Flush()
 
-    // Create AES-GCM cipher
-    block, err := aes.NewCipher(aesKey)
-    if err != nil {
-        return err
-    }
-    aesGCM, err := cipher.NewGCM(block)
-    if err != nil {
-        return err
-    }
+	// Read metadata header
+	header := make([]byte, 17)
+	if _, err := io.ReadFull(reader, header); err != nil {
+		return fmt.Errorf("error reading header: %v", err)
+	}
+	
+	totalSize := binary.BigEndian.Uint64(header[0:8])
+	encryptedSize := binary.BigEndian.Uint64(header[8:16])
+	encryptionPercentage := float64(header[16])
+	
+	fmt.Printf("📊 Original file size: %d bytes\n", totalSize)
+	fmt.Printf("🔒 Encrypted portion: %.1f%% (%d bytes)\n", encryptionPercentage, encryptedSize)
 
-    // Read and decrypt file chunk by chunk
-    for {
-        // Read nonce (12 bytes)
-        nonce := make([]byte, 12)
-        _, err := io.ReadFull(inFile, nonce)
-        if err != nil {
-            if err == io.EOF {
-                break
-            }
-            return err
-        }
+	// Create AES-GCM cipher
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return err
+	}
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
 
-        // Read encrypted chunk length (4 bytes)
-        lenBytes := make([]byte, 4)
-        if _, err := io.ReadFull(inFile, lenBytes); err != nil {
-            return err
-        }
-        ciphertextLen := binary.BigEndian.Uint32(lenBytes)
+	// Setup worker pool for decryption
+	numWorkers := runtime.NumCPU()
+	workChan := make(chan *DecryptWork, numWorkers*2)
+	resultChan := make(chan *DecryptWork, numWorkers*2)
+	
+	var wg sync.WaitGroup
 
-        // Read encrypted chunk
-        ciphertext := make([]byte, ciphertextLen)
-        if _, err := io.ReadFull(inFile, ciphertext); err != nil {
-            return err
-        }
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for work := range workChan {
+				if work.isEncrypted {
+					// Decrypt chunk
+					work.result, work.err = aesGCM.Open(nil, work.nonce, work.data, nil)
+				} else {
+					// Just copy plaintext
+					work.result = make([]byte, len(work.data))
+					copy(work.result, work.data)
+				}
+				resultChan <- work
+			}
+		}()
+	}
 
-        // Decrypt chunk
-        plaintext, err := aesGCM.Open(nil, nonce, ciphertext, nil)
-        if err != nil {
-            return err
-        }
+	// Start result writer goroutine
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
+	resultMap := make(map[int]*DecryptWork)
+	nextIndex := 0
+	
+	go func() {
+		defer writerWg.Done()
+		for work := range resultChan {
+			if work.err != nil {
+				fmt.Printf("Error decrypting chunk %d: %v\n", work.index, work.err)
+				continue
+			}
+			
+			resultMap[work.index] = work
+			
+			// Write results in order
+			for {
+				if result, exists := resultMap[nextIndex]; exists {
+					writer.Write(result.result)
+					delete(resultMap, nextIndex)
+					nextIndex++
+				} else {
+					break
+				}
+			}
+		}
+	}()
 
-        // Write decrypted data to output file
-        if _, err := outFile.Write(plaintext); err != nil {
-            return err
-        }
-    }
+	// Read and decrypt file chunk by chunk
+	chunkIndex := 0
+	for {
+		// Read chunk type marker
+		chunkType := make([]byte, 1)
+		_, err := io.ReadFull(reader, chunkType)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			close(workChan)
+			return err
+		}
 
-    fmt.Println("File successfully decrypted:", outputFile)
-    return nil
+		work := &DecryptWork{
+			index:       chunkIndex,
+			isEncrypted: chunkType[0] == 1,
+		}
+
+		if work.isEncrypted {
+			// Read nonce
+			work.nonce = make([]byte, 12)
+			if _, err := io.ReadFull(reader, work.nonce); err != nil {
+				close(workChan)
+				return err
+			}
+
+			// Read encrypted chunk length
+			lenBytes := make([]byte, 4)
+			if _, err := io.ReadFull(reader, lenBytes); err != nil {
+				close(workChan)
+				return err
+			}
+			ciphertextLen := binary.BigEndian.Uint32(lenBytes)
+
+			// Read encrypted chunk
+			work.data = make([]byte, ciphertextLen)
+			if _, err := io.ReadFull(reader, work.data); err != nil {
+				close(workChan)
+				return err
+			}
+		} else {
+			// Read plaintext length
+			lenBytes := make([]byte, 4)
+			if _, err := io.ReadFull(reader, lenBytes); err != nil {
+				close(workChan)
+				return err
+			}
+			plaintextLen := binary.BigEndian.Uint32(lenBytes)
+
+			// Read plaintext chunk
+			work.data = make([]byte, plaintextLen)
+			if _, err := io.ReadFull(reader, work.data); err != nil {
+				close(workChan)
+				return err
+			}
+		}
+
+		workChan <- work
+		chunkIndex++
+	}
+
+	// Close work channel and wait for workers
+	close(workChan)
+	wg.Wait()
+	
+	// Close result channel and wait for writer
+	close(resultChan)
+	writerWg.Wait()
+
+	fmt.Printf("✅ File successfully decrypted: %s\n", outputFile)
+	return nil
 }
 
 // Main function to execute decryption
