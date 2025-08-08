@@ -79,7 +79,11 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 	defer outFile.Close()
 
 	writer := bufio.NewWriterSize(outFile, 8*1024*1024) // 8MB buffer
-	defer writer.Flush()
+	defer func() {
+		if err := writer.Flush(); err != nil {
+			fmt.Printf("flush error: %v\n", err)
+		}
+	}()
 
 	// Read metadata header (supports v2 with magic "ENC2" and legacy v1)
 	var (
@@ -89,7 +93,6 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 		chunkSize            uint32
 		period               uint16
 		encryptBlocks        uint16
-		isV2                 bool
 	)
 
 	// Peek first 5 bytes to detect v2 header
@@ -104,7 +107,6 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 		if _, err := io.ReadFull(reader, rest); err != nil {
 			return fmt.Errorf("error reading v2 header: %v", err)
 		}
-		isV2 = true
 		// parse
 		totalSize = binary.BigEndian.Uint64(rest[0:8])
 		pctScaled := binary.BigEndian.Uint16(rest[8:10])
@@ -147,6 +149,8 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 	workChan := make(chan *DecryptWork, numWorkers*2)
 	resultChan := make(chan *DecryptWork, numWorkers*2)
 
+	var totalWritten uint64
+
 	var wg sync.WaitGroup
 
 	// Start worker goroutines
@@ -187,9 +191,11 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 			// Write results in order
 			for {
 				if result, exists := resultMap[nextIndex]; exists {
-					if _, err := writer.Write(result.result); err != nil {
+					if n, err := writer.Write(result.result); err != nil {
 						fmt.Printf("write error: %v\n", err)
 						return
+					} else {
+						totalWritten += uint64(n)
 					}
 					delete(resultMap, nextIndex)
 					nextIndex++
@@ -269,6 +275,17 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 	// Close result channel and wait for writer
 	close(resultChan)
 	writerWg.Wait()
+
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush error: %v", err)
+	}
+	if err := outFile.Sync(); err != nil {
+		return fmt.Errorf("fsync error: %v", err)
+	}
+
+	if totalWritten != totalSize {
+		return fmt.Errorf("size mismatch after decryption: wrote %d bytes, expected %d", totalWritten, totalSize)
+	}
 
 	fmt.Printf("✅ File successfully decrypted: %s\n", outputFile)
 	return nil

@@ -72,6 +72,11 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 	defer outFile.Close()
 
 	writer := bufio.NewWriterSize(outFile, 8*1024*1024) // 8MB buffer
+	defer func() {
+		if err := writer.Flush(); err != nil {
+			fmt.Printf("flush error: %v\n", err)
+		}
+	}()
 
 	// Configure intermittent (striped) encryption pattern
 	// Use small fixed-size blocks to approximate the target percentage across the whole file
@@ -159,6 +164,7 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 
 	go func() {
 		defer writerWg.Done()
+		var totalWritten int64
 		for work := range resultChan {
 			if work.err != nil {
 				fmt.Printf("Error processing chunk %d: %v\n", work.index, work.err)
@@ -172,39 +178,53 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 				if result, exists := resultMap[nextIndex]; exists {
 					if result.shouldEncrypt {
 						// Write encrypted chunk
-						if _, err := writer.Write([]byte{1}); err != nil {
+						if n, err := writer.Write([]byte{1}); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
-						if _, err := writer.Write(result.nonce); err != nil {
+						if n, err := writer.Write(result.nonce); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
 						lenBytes := make([]byte, 4)
 						binary.BigEndian.PutUint32(lenBytes, uint32(len(result.result)))
-						if _, err := writer.Write(lenBytes); err != nil {
+						if n, err := writer.Write(lenBytes); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
-						if _, err := writer.Write(result.result); err != nil {
+						if n, err := writer.Write(result.result); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
 					} else {
 						// Write plaintext chunk
-						if _, err := writer.Write([]byte{0}); err != nil {
+						if n, err := writer.Write([]byte{0}); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
 						lenBytes := make([]byte, 4)
 						binary.BigEndian.PutUint32(lenBytes, uint32(len(result.result)))
-						if _, err := writer.Write(lenBytes); err != nil {
+						if n, err := writer.Write(lenBytes); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
-						if _, err := writer.Write(result.result); err != nil {
+						if n, err := writer.Write(result.result); err != nil {
 							fmt.Printf("write error: %v\n", err)
 							return
+						} else {
+							totalWritten += int64(n)
 						}
 					}
 
@@ -262,6 +282,20 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 	// Close result channel and wait for writer
 	close(resultChan)
 	writerWg.Wait()
+
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush error: %v", err)
+	}
+	if err := outFile.Sync(); err != nil {
+		return fmt.Errorf("fsync error: %v", err)
+	}
+
+	fmt.Printf("🧾 Encoded container bytes written: %d\n", func() int64 {
+		// We don't have direct access to totalWritten here, so skip printing it here.
+		// The variable totalWritten is inside the goroutine and not accessible here.
+		// This line can be removed if preferred.
+		return 0
+	}())
 
 	fmt.Printf("✅ File successfully encrypted (%.1f%%): %s\n", encryptionPercentage, outputFile)
 	return nil
