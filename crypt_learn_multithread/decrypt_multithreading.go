@@ -7,8 +7,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"encoding/pem"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"os"
@@ -18,12 +18,12 @@ import (
 
 // DecryptWork represents decryption work for a goroutine
 type DecryptWork struct {
-	data       []byte
-	nonce      []byte
-	index      int
+	data        []byte
+	nonce       []byte
+	index       int
 	isEncrypted bool
-	result     []byte
-	err        error
+	result      []byte
+	err         error
 }
 
 // Increment nonce for each chunk
@@ -69,7 +69,7 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 		return err
 	}
 	defer inFile.Close()
-	
+
 	reader := bufio.NewReaderSize(inFile, 8*1024*1024) // 8MB buffer
 
 	outFile, err := os.Create(outputFile)
@@ -77,22 +77,62 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 		return err
 	}
 	defer outFile.Close()
-	
-	writer := bufio.NewWriterSize(outFile, 8*1024*1024) // 8MB buffer
-	defer writer.Flush()
 
-	// Read metadata header
-	header := make([]byte, 17)
-	if _, err := io.ReadFull(reader, header); err != nil {
-		return fmt.Errorf("error reading header: %v", err)
+	writer := bufio.NewWriterSize(outFile, 8*1024*1024) // 8MB buffer
+	defer func() {
+		if err := writer.Flush(); err != nil {
+			fmt.Printf("flush error: %v\n", err)
+		}
+	}()
+
+	// Read metadata header (supports v2 with magic "ENC2" and legacy v1)
+	var (
+		totalSize            uint64
+		encryptedSize        uint64
+		encryptionPercentage float64
+		chunkSize            uint32
+		period               uint16
+		encryptBlocks        uint16
+	)
+
+	// Peek first 5 bytes to detect v2 header
+	prefix := make([]byte, 5)
+	if _, err := io.ReadFull(reader, prefix); err != nil {
+		return fmt.Errorf("error reading header prefix: %v", err)
 	}
-	
-	totalSize := binary.BigEndian.Uint64(header[0:8])
-	encryptedSize := binary.BigEndian.Uint64(header[8:16])
-	encryptionPercentage := float64(header[16])
-	
-	fmt.Printf("📊 Original file size: %d bytes\n", totalSize)
-	fmt.Printf("🔒 Encrypted portion: %.1f%% (%d bytes)\n", encryptionPercentage, encryptedSize)
+
+	if string(prefix[0:4]) == "ENC2" && prefix[4] == 0x01 {
+		// v2 header, read remaining 18 bytes (total 23)
+		rest := make([]byte, 18)
+		if _, err := io.ReadFull(reader, rest); err != nil {
+			return fmt.Errorf("error reading v2 header: %v", err)
+		}
+		// parse
+		totalSize = binary.BigEndian.Uint64(rest[0:8])
+		pctScaled := binary.BigEndian.Uint16(rest[8:10])
+		encryptionPercentage = float64(pctScaled) / 100.0
+		chunkSize = binary.BigEndian.Uint32(rest[10:14])
+		period = binary.BigEndian.Uint16(rest[14:16])
+		encryptBlocks = binary.BigEndian.Uint16(rest[16:18])
+		// encryptedSize is approximate for v2; compute from pct
+		encryptedSize = uint64(float64(totalSize) * (encryptionPercentage / 100.0))
+		fmt.Printf("📊 Original file size: %d bytes\n", totalSize)
+		fmt.Printf("🔒 Intermittent encryption: %.2f%% (~%d bytes), block=%dB, pattern=%d/%d enc/plain\n",
+			encryptionPercentage, encryptedSize, chunkSize, encryptBlocks, period-encryptBlocks)
+	} else {
+		// legacy v1 header: we already consumed 5 bytes; we need remaining 12
+		rest := make([]byte, 12)
+		if _, err := io.ReadFull(reader, rest); err != nil {
+			return fmt.Errorf("error reading legacy header: %v", err)
+		}
+		header := append(prefix, rest...)
+		// parse legacy layout (17 bytes total)
+		totalSize = binary.BigEndian.Uint64(header[0:8])
+		encryptedSize = binary.BigEndian.Uint64(header[8:16])
+		encryptionPercentage = float64(header[16])
+		fmt.Printf("📊 Original file size: %d bytes\n", totalSize)
+		fmt.Printf("🔒 Encrypted portion: %.1f%% (%d bytes)\n", encryptionPercentage, encryptedSize)
+	}
 
 	// Create AES-GCM cipher
 	block, err := aes.NewCipher(aesKey)
@@ -108,7 +148,9 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 	numWorkers := runtime.NumCPU()
 	workChan := make(chan *DecryptWork, numWorkers*2)
 	resultChan := make(chan *DecryptWork, numWorkers*2)
-	
+
+	var totalWritten uint64
+
 	var wg sync.WaitGroup
 
 	// Start worker goroutines
@@ -135,7 +177,7 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 	writerWg.Add(1)
 	resultMap := make(map[int]*DecryptWork)
 	nextIndex := 0
-	
+
 	go func() {
 		defer writerWg.Done()
 		for work := range resultChan {
@@ -143,13 +185,18 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 				fmt.Printf("Error decrypting chunk %d: %v\n", work.index, work.err)
 				continue
 			}
-			
+
 			resultMap[work.index] = work
-			
+
 			// Write results in order
 			for {
 				if result, exists := resultMap[nextIndex]; exists {
-					writer.Write(result.result)
+					if n, err := writer.Write(result.result); err != nil {
+						fmt.Printf("write error: %v\n", err)
+						return
+					} else {
+						totalWritten += uint64(n)
+					}
 					delete(resultMap, nextIndex)
 					nextIndex++
 				} else {
@@ -224,10 +271,21 @@ func decryptFileStream(inputFile, outputFile string, aesKey []byte) error {
 	// Close work channel and wait for workers
 	close(workChan)
 	wg.Wait()
-	
+
 	// Close result channel and wait for writer
 	close(resultChan)
 	writerWg.Wait()
+
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush error: %v", err)
+	}
+	if err := outFile.Sync(); err != nil {
+		return fmt.Errorf("fsync error: %v", err)
+	}
+
+	if totalWritten != totalSize {
+		return fmt.Errorf("size mismatch after decryption: wrote %d bytes, expected %d", totalWritten, totalSize)
+	}
 
 	fmt.Printf("✅ File successfully decrypted: %s\n", outputFile)
 	return nil
