@@ -7,10 +7,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"encoding/pem"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"strconv"
@@ -62,7 +63,6 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 	bytesToEncrypt := int64(float64(totalSize) * (encryptionPercentage / 100.0))
 
 	fmt.Printf("📊 File size: %d bytes\n", totalSize)
-	fmt.Printf("🔒 Encrypting %.1f%% (%d bytes)\n", encryptionPercentage, bytesToEncrypt)
 
 	// Create output file with larger buffer
 	outFile, err := os.Create(outputFile)
@@ -72,17 +72,40 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 	defer outFile.Close()
 
 	writer := bufio.NewWriterSize(outFile, 8*1024*1024) // 8MB buffer
-	defer writer.Flush()
 
-	// Write metadata header
-	header := make([]byte, 17)
-	binary.BigEndian.PutUint64(header[0:8], uint64(totalSize))
-	binary.BigEndian.PutUint64(header[8:16], uint64(bytesToEncrypt))
-	header[16] = byte(encryptionPercentage)
+	// Configure intermittent (striped) encryption pattern
+	// Use small fixed-size blocks to approximate the target percentage across the whole file
+	chunkSize := 64 * 1024 // 64KB blocks for fine-grained striping
+	period := uint16(100)  // window of 100 blocks
+	// number of encrypted blocks in each 100-block window, rounded from percentage
+	encryptBlocks := uint16(math.Round(encryptionPercentage))
+	if encryptBlocks > period {
+		encryptBlocks = period
+	}
 
+	// New header v2 layout (23 bytes):
+	// [0:4]  Magic "ENC2"
+	// [4]    Version 0x01
+	// [5:13] totalSize (u64)
+	// [13:15] percentage*100 (u16)
+	// [15:19] chunkSize (u32)
+	// [19:21] period (u16)
+	// [21:23] encryptBlocks (u16)
+	header := make([]byte, 23)
+	copy(header[0:4], []byte{'E', 'N', 'C', '2'})
+	header[4] = 0x01
+	binary.BigEndian.PutUint64(header[5:13], uint64(totalSize))
+	pctScaled := uint16(math.Round(encryptionPercentage * 100))
+	binary.BigEndian.PutUint16(header[13:15], pctScaled)
+	binary.BigEndian.PutUint32(header[15:19], uint32(chunkSize))
+	binary.BigEndian.PutUint16(header[19:21], period)
+	binary.BigEndian.PutUint16(header[21:23], encryptBlocks)
 	if _, err := writer.Write(header); err != nil {
 		return err
 	}
+
+	fmt.Printf("🔒 Intermittent encryption: target %.1f%% (~%d bytes), block=%dB, pattern=%d/%d enc/plain\n",
+		encryptionPercentage, bytesToEncrypt, chunkSize, encryptBlocks, period-encryptBlocks)
 
 	// Create AES-GCM cipher
 	block, err := aes.NewCipher(aesKey)
@@ -96,7 +119,6 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 
 	// Setup worker pool
 	numWorkers := runtime.NumCPU()
-	chunkSize := 4 * 1024 * 1024 // 4MB chunks for better performance
 	workChan := make(chan *ChunkWork, numWorkers*2)
 	resultChan := make(chan *ChunkWork, numWorkers*2)
 
@@ -150,21 +172,40 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 				if result, exists := resultMap[nextIndex]; exists {
 					if result.shouldEncrypt {
 						// Write encrypted chunk
-						writer.Write([]byte{1}) // encrypted marker
-						writer.Write(result.nonce)
-
+						if _, err := writer.Write([]byte{1}); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
+						if _, err := writer.Write(result.nonce); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
 						lenBytes := make([]byte, 4)
 						binary.BigEndian.PutUint32(lenBytes, uint32(len(result.result)))
-						writer.Write(lenBytes)
-						writer.Write(result.result)
+						if _, err := writer.Write(lenBytes); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
+						if _, err := writer.Write(result.result); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
 					} else {
 						// Write plaintext chunk
-						writer.Write([]byte{0}) // plaintext marker
-
+						if _, err := writer.Write([]byte{0}); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
 						lenBytes := make([]byte, 4)
 						binary.BigEndian.PutUint32(lenBytes, uint32(len(result.result)))
-						writer.Write(lenBytes)
-						writer.Write(result.result)
+						if _, err := writer.Write(lenBytes); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
+						if _, err := writer.Write(result.result); err != nil {
+							fmt.Printf("write error: %v\n", err)
+							return
+						}
 					}
 
 					delete(resultMap, nextIndex)
@@ -197,8 +238,9 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 			break
 		}
 
-		// Determine if this chunk should be encrypted
-		shouldEncrypt := processedBytes < bytesToEncrypt
+		// Determine if this block should be encrypted (intermittent/striped)
+		blockIndex := chunkIndex % int(period)
+		shouldEncrypt := blockIndex < int(encryptBlocks)
 
 		// Create work item
 		work := &ChunkWork{
