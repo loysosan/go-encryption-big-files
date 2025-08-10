@@ -9,10 +9,12 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -59,6 +61,88 @@ func loadRSAPrivateKey(filename string) (*rsa.PrivateKey, error) {
 // Decrypt AES key using RSA private key
 func decryptAESKey(encryptedAESKey []byte, privateKey *rsa.PrivateKey) ([]byte, error) {
 	return rsa.DecryptPKCS1v15(rand.Reader, privateKey, encryptedAESKey)
+}
+
+// In-place decryption using ENC2I map and AES-CTR (striped blocks)
+func decryptInPlaceMap(mapPath string, key []byte) error {
+	mf, err := os.Open(mapPath)
+	if err != nil {
+		return err
+	}
+	defer mf.Close()
+	r := bufio.NewReaderSize(mf, 1<<20)
+
+	// Fixed 30-byte header
+	hdr := make([]byte, 30)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return fmt.Errorf("read encmap header: %v", err)
+	}
+	if string(hdr[0:5]) != "ENC2I" || hdr[5] != 0x01 {
+		return fmt.Errorf("invalid encmap header")
+	}
+
+	totalSize := int64(binary.BigEndian.Uint64(hdr[6:14]))
+	chunkSize := int64(binary.BigEndian.Uint32(hdr[14:18]))
+	period := int(binary.BigEndian.Uint16(hdr[18:20]))
+	encryptBlocks := int(binary.BigEndian.Uint16(hdr[20:22]))
+	countEnc := binary.BigEndian.Uint64(hdr[22:30])
+
+	// target file is the same basename without .encmap
+	target := strings.TrimSuffix(mapPath, ".encmap")
+	f, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, chunkSize)
+	var processed int64
+	var chunkIndex int
+	var used uint64
+
+	for processed < totalSize {
+		remaining := totalSize - processed
+		rs := chunkSize
+		if rs > remaining {
+			rs = remaining
+		}
+
+		// striped decision mirrors encryption
+		blockIdx := chunkIndex % period
+		shouldDecrypt := blockIdx < encryptBlocks
+
+		if shouldDecrypt {
+			iv := make([]byte, aes.BlockSize)
+			if _, err := io.ReadFull(r, iv); err != nil {
+				return fmt.Errorf("read iv: %v", err)
+			}
+			used++
+
+			if _, err := f.ReadAt(buf[:rs], processed); err != nil && !errors.Is(err, io.EOF) {
+				return err
+			}
+			stream := cipher.NewCTR(block, iv)
+			out := make([]byte, rs)
+			stream.XORKeyStream(out, buf[:rs])
+			if _, err := f.WriteAt(out, processed); err != nil {
+				return err
+			}
+		}
+
+		processed += rs
+		chunkIndex++
+	}
+
+	if used != countEnc {
+		return fmt.Errorf("encmap mismatch: used %d ivs, expected %d", used, countEnc)
+	}
+	fmt.Println("✅ In-place decryption completed")
+	return nil
 }
 
 // Optimized stream decrypt with multithreading
@@ -297,10 +381,8 @@ func main() {
 		fmt.Println("Usage: go run decrypt.go <encrypted_file> <encrypted_key_file>")
 		return
 	}
-
 	encryptedFile := os.Args[1]
 	encryptedKeyFile := os.Args[2]
-	outputFile := encryptedFile + ".dec"
 
 	// Load private RSA key
 	privateKey, err := loadRSAPrivateKey("private.pem")
@@ -309,26 +391,31 @@ func main() {
 		return
 	}
 
-	// Read encrypted AES key
 	encryptedAESKey, err := os.ReadFile(encryptedKeyFile)
 	if err != nil {
 		fmt.Println("Error reading encrypted AES key:", err)
 		return
 	}
 
-	// Decrypt AES key using RSA private key
 	aesKey, err := decryptAESKey(encryptedAESKey, privateKey)
 	if err != nil {
 		fmt.Println("Error decrypting AES key:", err)
 		return
 	}
-
-	// Debugging AES key
 	fmt.Printf("🔑 AES Key after decryption: %x\n", aesKey)
 
-	// Decrypt file using AES-256-GCM in streaming mode
-	err = decryptFileStream(encryptedFile, outputFile, aesKey)
-	if err != nil {
+	// Detect ENC2I map for in-place decryption
+	if _, err := os.Stat(encryptedFile + ".encmap"); err == nil {
+		if err := decryptInPlaceMap(encryptedFile+".encmap", aesKey); err != nil {
+			fmt.Println("Error in-place decrypting file:", err)
+			return
+		}
+		return
+	}
+
+	// streaming container path
+	outputFile := encryptedFile + ".dec"
+	if err := decryptFileStream(encryptedFile, outputFile, aesKey); err != nil {
 		fmt.Println("Error decrypting file:", err)
 		return
 	}

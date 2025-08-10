@@ -2,3 +2,5 @@
 **/decrypted_testfiles/
 **/*.pem
 .DS_Store
+HM-*
+linux-*
