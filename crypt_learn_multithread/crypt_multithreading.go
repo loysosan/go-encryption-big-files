@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -28,6 +29,29 @@ type ChunkWork struct {
 	err           error
 }
 
+const (
+	inplaceChunkSize = 64 * 1024 // 64KB fixed block for in-place
+	inplacePeriod    = uint16(100)
+)
+
+// encmap header for in-place CTR mode
+// Magic: "ENC2I" (5 bytes), Version: 0x01 (1 byte)
+// Layout (fixed-size header 5+1+8+4+2+2+8 = 30 bytes):
+// [0:5]  Magic
+// [5]    Version
+// [6:14] totalSize (u64)
+// [14:18] chunkSize (u32)
+// [18:20] period (u16)
+// [20:22] encryptBlocks (u16)
+// [22:30] countEncrypted (u64)
+type inplaceHeader struct {
+	totalSize     uint64
+	chunkSize     uint32
+	period        uint16
+	encryptBlocks uint16
+	countEnc      uint64
+}
+
 // Generate RSA key pair
 func generateRSAKeys(bits int) (*rsa.PrivateKey, error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
@@ -41,6 +65,130 @@ func generateRSAKeys(bits int) (*rsa.PrivateKey, error) {
 func encryptAESKey(aesKey []byte, publicKey *rsa.PublicKey) ([]byte, error) {
 	fmt.Printf("🔑 AES Key before encryption: %x\n", aesKey)
 	return rsa.EncryptPKCS1v15(rand.Reader, publicKey, aesKey)
+}
+
+// In-place intermittent encryption using AES-CTR (size preserving)
+func encryptFileInPlace(inputFile string, aesKey []byte, encryptionPercentage float64) error {
+	// open file read-write
+	f, err := os.OpenFile(inputFile, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	totalSize := st.Size()
+
+	// compute pattern
+	encryptBlocks := uint16(math.Round(encryptionPercentage))
+	if encryptBlocks > inplacePeriod {
+		encryptBlocks = inplacePeriod
+	}
+
+	// prepare encmap
+	mapPath := inputFile + ".encmap"
+	mf, err := os.Create(mapPath)
+	if err != nil {
+		return err
+	}
+	defer mf.Close()
+	mw := bufio.NewWriterSize(mf, 1<<20)
+	defer mw.Flush()
+
+	// write header
+	hdr := make([]byte, 30)
+	copy(hdr[0:5], []byte{'E', 'N', 'C', '2', 'I'})
+	hdr[5] = 0x01
+	binary.BigEndian.PutUint64(hdr[6:14], uint64(totalSize))
+	binary.BigEndian.PutUint32(hdr[14:18], uint32(inplaceChunkSize))
+	binary.BigEndian.PutUint16(hdr[18:20], inplacePeriod)
+	binary.BigEndian.PutUint16(hdr[20:22], encryptBlocks)
+	// countEnc unknown yet; fill later after pass
+	if _, err := mw.Write(hdr); err != nil {
+		return err
+	}
+
+	// AES block
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, inplaceChunkSize)
+	var chunkIndex int
+	var processed int64
+	var countEnc uint64
+
+	for processed < totalSize {
+		// calc remaining and read size
+		remaining := totalSize - processed
+		readSize := int64(inplaceChunkSize)
+		if readSize > remaining {
+			readSize = remaining
+		}
+
+		// read block
+		if _, err := f.ReadAt(buf[:readSize], processed); err != nil {
+			if errors.Is(err, io.EOF) { /* ok */
+			} else {
+				return err
+			}
+		}
+
+		// decide stripe
+		blockIndex := chunkIndex % int(inplacePeriod)
+		shouldEncrypt := blockIndex < int(encryptBlocks)
+
+		if shouldEncrypt {
+			// generate 16-byte IV for CTR
+			iv := make([]byte, aes.BlockSize)
+			if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+				return err
+			}
+
+			stream := cipher.NewCTR(block, iv)
+			// CTR can operate in-place; make a copy of slice window
+			out := make([]byte, readSize)
+			stream.XORKeyStream(out, buf[:readSize])
+
+			if _, err := f.WriteAt(out, processed); err != nil {
+				return err
+			}
+
+			// append IV to map (no offsets needed since pattern is deterministic)
+			if _, err := mw.Write(iv); err != nil {
+				return err
+			}
+			countEnc++
+		}
+
+		processed += readSize
+		chunkIndex++
+	}
+
+	// patch countEnc in header
+	// flush buffered IVs first to ensure file size known
+	if err := mw.Flush(); err != nil {
+		return err
+	}
+	// rewrite header bytes 22:30
+	if _, err := mf.Seek(22, io.SeekStart); err != nil {
+		return err
+	}
+	tmp := make([]byte, 8)
+	binary.BigEndian.PutUint64(tmp, countEnc)
+	if _, err := mf.Write(tmp); err != nil {
+		return err
+	}
+	if err := mf.Sync(); err != nil {
+		return err
+	}
+
+	fmt.Printf("🧩 In-place map saved: %s (blocks=%d)\n", mapPath, countEnc)
+	return nil
 }
 
 // Optimized encryption method with multithreading
@@ -262,15 +410,29 @@ func encryptFileStream(inputFile, outputFile string, aesKey []byte, encryptionPe
 		blockIndex := chunkIndex % int(period)
 		shouldEncrypt := blockIndex < int(encryptBlocks)
 
-		// Create work item
-		work := &ChunkWork{
-			data:          make([]byte, n),
-			index:         chunkIndex,
-			shouldEncrypt: shouldEncrypt,
+		if shouldEncrypt {
+			// Encrypted path -> send to worker pool
+			work := &ChunkWork{
+				data:          make([]byte, n),
+				index:         chunkIndex,
+				shouldEncrypt: true,
+			}
+			copy(work.data, buffer[:n])
+			workChan <- work
+		} else {
+			// Plaintext path -> bypass worker pool and send directly to writer
+			plain := make([]byte, n)
+			copy(plain, buffer[:n])
+			resultChan <- &ChunkWork{
+				data:          nil, // not needed
+				index:         chunkIndex,
+				shouldEncrypt: false,
+				result:        plain,
+				nonce:         nil,
+				err:           nil,
+			}
 		}
-		copy(work.data, buffer[:n])
 
-		workChan <- work
 		processedBytes += int64(n)
 		chunkIndex++
 	}
@@ -341,7 +503,7 @@ func incrementNonce(nonce []byte) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run encrypt.go <file> [encryption_percentage]")
+		fmt.Println("Usage: go run encrypt.go <file> [encryption_percentage] [--inplace]")
 		fmt.Println("Example: go run encrypt.go myfile.txt 50")
 		fmt.Println("Default encryption percentage is 100%")
 		return
@@ -367,48 +529,87 @@ func main() {
 		}
 	}
 
+	inplace := false
+	if len(os.Args) >= 4 && os.Args[3] == "--inplace" {
+		inplace = true
+	}
+
+	if inplace {
+		// In-place mode uses AES-CTR and sidecar encmap; no container is produced
+		// Generate AES-256 key
+		aesKey := make([]byte, 32)
+		if _, err := rand.Read(aesKey); err != nil {
+			fmt.Println("Error generating AES key:", err)
+			return
+		}
+		// Perform in-place encryption
+		if err := encryptFileInPlace(inputFile, aesKey, encryptionPercentage); err != nil {
+			fmt.Println("Error (in-place) encrypting file:", err)
+			return
+		}
+		// Generate RSA keys and save (so we can store encrypted AES key like before)
+		privateKey, err := generateRSAKeys(2048)
+		if err != nil {
+			fmt.Println("Error generating RSA keys:", err)
+			return
+		}
+		if err := saveRSAKeys(privateKey); err != nil {
+			fmt.Println("Error saving RSA keys:", err)
+			return
+		}
+		// Save encrypted AES key to .key.enc (same basename)
+		encryptedAESKey, err := encryptAESKey(aesKey, &privateKey.PublicKey)
+		if err != nil {
+			fmt.Println("Error encrypting AES key:", err)
+			return
+		}
+		keyFile := inputFile + ".key.enc"
+		if err := os.WriteFile(keyFile, encryptedAESKey, 0644); err != nil {
+			fmt.Println("Error saving encrypted AES key:", err)
+			return
+		}
+		fmt.Println("✅ In-place encryption completed")
+		fmt.Printf("🔑 Encrypted AES key saved: %s\n", keyFile)
+		fmt.Println("🔐 RSA keys saved in private.pem and public.pem")
+		return
+	}
+	// --- streaming container mode (existing) ---
 	// Generate RSA key pair (2048-bit)
 	privateKey, err := generateRSAKeys(2048)
 	if err != nil {
 		fmt.Println("Error generating RSA keys:", err)
 		return
 	}
-
 	// Save RSA keys
 	err = saveRSAKeys(privateKey)
 	if err != nil {
 		fmt.Println("Error saving RSA keys:", err)
 		return
 	}
-
 	// Generate AES-256 key (32 bytes)
 	aesKey := make([]byte, 32)
 	if _, err := rand.Read(aesKey); err != nil {
 		fmt.Println("Error generating AES key:", err)
 		return
 	}
-
 	// Encrypt file using streaming AES-GCM with specified percentage
 	err = encryptFileStream(inputFile, outputFile, aesKey, encryptionPercentage)
 	if err != nil {
 		fmt.Println("Error encrypting file:", err)
 		return
 	}
-
 	// Encrypt AES key with RSA public key
 	encryptedAESKey, err := encryptAESKey(aesKey, &privateKey.PublicKey)
 	if err != nil {
 		fmt.Println("Error encrypting AES key:", err)
 		return
 	}
-
 	// Save encrypted AES key
 	err = os.WriteFile(keyFile, encryptedAESKey, 0644)
 	if err != nil {
 		fmt.Println("Error saving encrypted AES key:", err)
 		return
 	}
-
 	fmt.Println("📁 Encrypted file:", outputFile)
 	fmt.Println("🔑 Encrypted AES key saved:", keyFile)
 	fmt.Println("🔐 RSA keys saved in private.pem and public.pem")
